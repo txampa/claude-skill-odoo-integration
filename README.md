@@ -92,7 +92,7 @@ Claude Code discovers skills automatically from `~/.claude/skills/`. No configur
 
 ## Credits
 
-Created by [@Txampa](https://github.com/txampa) and [@JeanOnCode](https://github.com/JeanOnCode).
+Created by [@Txampa](https://github.com/txampa) - JeanOnCode.
 
 Built from a real production integration running on Odoo v8. Expanded to cover v8–v17 field differences and cross-version safe patterns.
 
