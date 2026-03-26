@@ -1,5 +1,6 @@
 ---
 name: odoo-integration
+version: "1.0.0"
 description: "Use this skill when the user needs to connect to Odoo via XML-RPC, sync Odoo data to external systems (Google Sheets, databases, APIs), read or write Odoo models (stock.picking, sale.order, purchase.order, product.product, etc.), set up cron-based sync jobs, or deploy Odoo integrations on Railway/Render/Fly.io. Also use when the user mentions albaranes, pedidos, stock, ERP sync, or Odoo automation. Do NOT trigger for generic REST API tasks or non-Odoo ERP systems."
 license: MIT. See LICENSE.txt
 ---
