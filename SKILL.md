@@ -1,13 +1,15 @@
 ---
 name: odoo-integration
-version: "1.0.0"
-description: "Use this skill when the user needs to connect to Odoo via XML-RPC, sync Odoo data to external systems (Google Sheets, databases, APIs), read or write Odoo models (stock.picking, sale.order, purchase.order, product.product, etc.), set up cron-based sync jobs, or deploy Odoo integrations on Railway/Render/Fly.io. Also use when the user mentions albaranes, pedidos, stock, ERP sync, or Odoo automation. Do NOT trigger for generic REST API tasks or non-Odoo ERP systems."
+version: "2.0.0"
+description: "Use this skill when the user needs to connect to Odoo via XML-RPC or the JSON-2 API (Odoo 19+), migrate an integration from XML-RPC to JSON-2, sync Odoo data to external systems (Google Sheets, databases, APIs), read or write Odoo models (stock.picking, sale.order, purchase.order, product.product, etc.), set up cron-based sync jobs, or deploy Odoo integrations on Railway/Render/Fly.io. Also use when the user mentions albaranes, pedidos, stock, ERP sync, or Odoo automation. Do NOT trigger for generic REST API tasks or non-Odoo ERP systems."
 license: MIT. See LICENSE.txt
 ---
 
 # Odoo Integration Skill
 
-You are an expert in Odoo XML-RPC integrations using Node.js. You know the quirks of Odoo v8 through v17, the exact XML-RPC endpoint structure, key model names and their states, and how to sync data reliably to external systems.
+You are an expert in Odoo integrations using Node.js, over XML-RPC (Odoo 8 to 19) and the External JSON-2 API (Odoo 19+). You know the quirks of each version, which field names changed and when, key model names and their states, and how to sync data reliably to external systems.
+
+**First question on any Odoo task: which version?** Field names, states and even the API depend on it (see "Version compatibility" in Common Gotchas). If the user doesn't know, read it from `/web/version` or from the XML-RPC `version()` call before writing code.
 
 ---
 
@@ -19,7 +21,8 @@ Every Odoo integration follows this structure:
 odoo-sync/
 ├── index.js              # Entry point + cron scheduler
 ├── config/
-│   └── odoo.js           # OdooClient class (XML-RPC)
+│   ├── odoo.js           # OdooClient class (XML-RPC, Odoo 8–19)
+│   └── odoo-json2.js     # OdooJson2Client class (JSON-2, Odoo 19+), same methods
 ├── utils/
 │   ├── sync.js           # SyncManager (business logic)
 │   └── sheets.js         # Output client (Sheets, DB, etc.)
@@ -33,9 +36,28 @@ odoo-sync/
 
 ---
 
+## Which API: XML-RPC or JSON-2
+
+| Odoo version | API to use | Notes |
+|---|---|---|
+| 8 – 18 | XML-RPC (`OdooClient`) | The only external API. JSON-RPC (`/jsonrpc`) also exists but adds nothing for integrations. |
+| 19+ | **JSON-2** (`OdooJson2Client`) for new work | XML-RPC still works but is deprecated since 19.0. |
+| Odoo 22 (fall 2028) · Odoo Online 21.1 (winter 2027) | JSON-2 only | `/xmlrpc`, `/xmlrpc/2` and `/jsonrpc` are scheduled for removal. |
+
+- **Odoo Online (SaaS):** external API access, old and new, is only available on the **Custom** pricing plan.
+  Check the plan before promising an integration.
+- **Migrating an existing integration:** both clients below expose the same methods (`authenticate`,
+  `searchRead`, `read`, `create`, `write`, `search`). Swap the client, switch the env vars from login/password
+  to an API key, re-check field names for the new version, and the business logic stays as it is.
+- **JSON-2 runs each call in its own transaction.** Two calls are two commits: if the second fails, the first
+  is not rolled back. For multi-step writes, call one server method that does everything (an `action_*`
+  method, or a custom one in a small module).
+
+---
+
 ## OdooClient — XML-RPC Base Class
 
-Always use this class as the foundation. Never call xmlrpc directly from business logic.
+Always use this class (or `OdooJson2Client` on Odoo 19+) as the foundation. Never call xmlrpc or fetch directly from business logic.
 
 ```javascript
 // config/odoo.js
@@ -151,10 +173,123 @@ class OdooClient {
       });
     });
   }
+
+  // { field_name: { type, store, ... } } — use it to pick field names for the server's version
+  async fieldsGet(model, attributes = ['type', 'store', 'string']) {
+    if (!this.authenticated) throw new Error('Call authenticate() first');
+    return new Promise((resolve, reject) => {
+      this.objectClient.methodCall('execute_kw', [
+        this.database, this.uid, this.password,
+        model, 'fields_get', [],
+        { attributes }
+      ], (error, result) => {
+        if (error) reject(error);
+        else resolve(result);
+      });
+    });
+  }
 }
 
 module.exports = OdooClient;
 ```
+
+---
+
+## OdooJson2Client — JSON-2 API (Odoo 19+)
+
+Same methods as `OdooClient`, no dependencies (Node 18+ `fetch`). Every call is
+`POST /json/2/<model>/<method>` with the API key as a bearer token and the method's arguments **by name**
+(no positional arguments: the names must match the Python signature, e.g. `vals_list` for `create`).
+
+```javascript
+// config/odoo-json2.js
+class OdooJson2Client {
+  constructor(config = {}) {
+    this.baseUrl  = (config.baseUrl || process.env.ODOO_URL || '').replace(/\/+$/, ''); // https://erp.example.com
+    this.apiKey   = config.apiKey   || process.env.ODOO_API_KEY;
+    // Only needed when several databases share the same host and dbfilter can't pick one
+    this.database = config.database || process.env.ODOO_DATABASE;
+    this.uid = null;
+    this.authenticated = false;
+    if (!this.baseUrl || !this.apiKey) throw new Error('ODOO_URL and ODOO_API_KEY are required');
+  }
+
+  async call(model, method, body = {}) {
+    const headers = {
+      'Authorization': `bearer ${this.apiKey}`,
+      'Content-Type': 'application/json; charset=utf-8',
+      'User-Agent': 'odoo-sync',
+    };
+    if (this.database) headers['X-Odoo-Database'] = this.database;
+
+    const res = await fetch(`${this.baseUrl}/json/2/${model}/${method}`, {
+      method: 'POST', headers, body: JSON.stringify(body),
+    });
+    const text = await res.text();
+    let data;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {
+      throw new Error(`Odoo ${model}.${method}: HTTP ${res.status}, response is not JSON: ${text.slice(0, 200)}`);
+    }
+    if (!res.ok) {
+      // Odoo sends { name, message, arguments, context, debug } on 4xx/5xx
+      const err = new Error(`Odoo ${model}.${method}: HTTP ${res.status} ${data?.name ?? ''}: ${data?.message ?? text.slice(0, 200)}`);
+      err.status = res.status;
+      err.odoo = data;
+      throw err;
+    }
+    return data;
+  }
+
+  // JSON-2 has no login step: the API key identifies the user. This checks the key and stores the uid.
+  async authenticate() {
+    const ctx = await this.call('res.users', 'context_get');
+    this.uid = ctx.uid;
+    this.authenticated = true;
+    return this.uid;
+  }
+
+  searchRead(model, domain = [], fields = [], options = {}) {
+    return this.call(model, 'search_read', {
+      domain,
+      fields: fields.length > 0 ? fields : ['id', 'name'],
+      limit: options.limit || 100,
+      order: options.order || 'id desc',
+      offset: options.offset || 0,
+    });
+  }
+
+  async read(model, id, fields = []) {
+    const rows = await this.call(model, 'read', { ids: [id], fields: fields.length > 0 ? fields : null });
+    return rows.length > 0 ? rows[0] : null;
+  }
+
+  async create(model, values) {
+    const ids = await this.call(model, 'create', { vals_list: [values] });
+    return ids[0]; // methods that return records come back as a list of ids
+  }
+
+  write(model, ids, values) {
+    return this.call(model, 'write', { ids, vals: values }); // returns true
+  }
+
+  search(model, domain = [], options = {}) {
+    return this.call(model, 'search', { domain, limit: options.limit || 100 }); // returns array of IDs
+  }
+
+  fieldsGet(model, attributes = ['type', 'store', 'string']) {
+    return this.call(model, 'fields_get', { attributes });
+  }
+}
+
+module.exports = OdooJson2Client;
+```
+
+**API keys** (Preferences → Account Security → New API Key, or `res.users.apikeys.generate` from code):
+- Last **3 months at most**. Put the expiry date in your calendar or rotate them from code.
+- Shown only once. Create one per integration, on a dedicated user with the minimum access rights.
+- A wrong or expired key returns `HTTP 401 werkzeug.exceptions.Unauthorized: Invalid apikey`.
 
 ---
 
@@ -172,10 +307,13 @@ module.exports = OdooClient;
 | `done` | Hecho |
 | `cancel` | Cancelado |
 
-**Key fields:**
+**Key fields** (asking for a field that doesn't exist in that version makes the whole call fail):
 ```javascript
-['id', 'name', 'state', 'date', 'move_lines', 'origin',
+// Odoo 16+
+['id', 'name', 'state', 'date', 'move_ids', 'origin',
  'partner_id', 'picking_type_id', 'scheduled_date']
+// Odoo 11–15: 'move_lines' instead of 'move_ids'
+// Odoo 8–10:  'move_lines' and 'min_date' instead of 'scheduled_date'
 ```
 
 **Typical domain — "Esperando Disponibilidad":**
@@ -201,15 +339,17 @@ module.exports = OdooClient;
 
 **Key fields:**
 ```javascript
+// Odoo 17+
 ['id', 'product_id', 'state', 'product_uom_qty',
- 'quantity_done', 'name', 'picking_id']
+ 'quantity', 'name', 'picking_id']
+// Odoo 8–16: 'quantity_done' instead of 'quantity'
 ```
 
 **To get lines for a picking:**
 ```javascript
 const moveLines = await odoo.searchRead(
   'stock.move',
-  [['id', 'in', picking.move_lines]],
+  [['picking_id', '=', picking.id]], // works in every version, no need to know move_ids vs move_lines
   ['id', 'product_id', 'state', 'product_uom_qty', 'name']
 );
 // Filter by state:
@@ -231,13 +371,16 @@ const cleanName = product.replace(/^\s*\[.*?\]\s*/, '').trim();
 | `draft` | Presupuesto |
 | `sent` | Presupuesto enviado |
 | `sale` | Pedido de venta |
-| `done` | Bloqueado |
+| `done` | Bloqueado (**Odoo 8–16 only**) |
 | `cancel` | Cancelado |
+
+**Odoo 17+:** there is no `done` state. A locked order stays in `sale` with the boolean `locked = true`.
 
 **Key fields:**
 ```javascript
 ['id', 'name', 'state', 'date_order', 'partner_id',
  'amount_total', 'order_line', 'picking_ids']
+// Odoo 17+: add 'locked' if you need to know whether it's locked
 ```
 
 ---
@@ -245,6 +388,8 @@ const cleanName = product.replace(/^\s*\[.*?\]\s*/, '').trim();
 ### purchase.order — Pedidos de Compra
 
 **States:** `draft`, `sent`, `to approve`, `purchase`, `done`, `cancel`
+
+**Odoo 19+:** `done` is gone, same change as sale.order: locked orders stay in `purchase` with `locked = true`.
 
 **Key fields:**
 ```javascript
@@ -266,13 +411,24 @@ const products = await odoo.searchRead(
 );
 ```
 
+**Stockable products changed in Odoo 18:**
+```javascript
+// Odoo 8–17: stockable = type 'product'
+[['type', '=', 'product']]
+// Odoo 18+: type is 'consu' | 'service' | 'combo', stock tracking is a separate boolean
+[['type', '=', 'consu'], ['is_storable', '=', true]]
+```
+
 ---
 
 ### res.partner — Clientes/Proveedores
 
 ```javascript
+// Odoo 13+
 ['id', 'name', 'email', 'phone', 'street', 'city',
  'country_id', 'customer_rank', 'supplier_rank']
+// Odoo 8–12: booleans 'customer' and 'supplier' instead of the *_rank fields
+// Odoo 19+: 'mobile' no longer exists (only 'phone')
 ```
 
 ---
@@ -305,12 +461,19 @@ class SyncManager {
       domain.push(['date', '>=', lastDate]);
     }
 
-    // 4. Fetch from Odoo
+    // 4. Fetch from Odoo — field name depends on the version (move_ids since 16)
+    const pickingFields = await this.odoo.fieldsGet('stock.picking');
+    const LINES = 'move_ids' in pickingFields ? 'move_ids' : 'move_lines';
+    const LIMIT = 1000;
     const records = await this.odoo.searchRead(
       'stock.picking', domain,
-      ['id', 'name', 'state', 'date', 'move_lines', 'origin'],
-      { limit: 1000, order: 'date asc' }
+      ['id', 'name', 'state', 'date', LINES, 'origin'],
+      { limit: LIMIT, order: 'date asc' }
     );
+    if (records.length === LIMIT) {
+      // More records than the limit: with 'date asc' the newest ones were left out. Page with offset or narrow the domain.
+      console.warn(`stock.picking: got exactly ${LIMIT} records, some were not read`);
+    }
 
     // 5. Process and deduplicate
     const rows = [];
@@ -320,7 +483,7 @@ class SyncManager {
 
       const detail = await this.odoo.read(
         'stock.picking', record.id,
-        ['id', 'name', 'date', 'move_lines', 'origin']
+        ['id', 'name', 'date', LINES, 'origin']
       );
       if (!detail) continue;
 
@@ -459,12 +622,17 @@ process.on('SIGTERM', () => process.exit(0));
 ## Environment Variables
 
 ```env
-# Odoo
+# Odoo — XML-RPC (OdooClient)
 ODOO_HOST=erp.yourcompany.com
 ODOO_DATABASE=production_db
 ODOO_LOGIN=sync_user@company.com
-ODOO_PASSWORD=your_password
+ODOO_PASSWORD=your_password   # an API key also works here instead of the password
 ODOO_PORT=443
+
+# Odoo — JSON-2, Odoo 19+ (OdooJson2Client)
+ODOO_URL=https://erp.yourcompany.com
+ODOO_API_KEY=your_api_key     # expires in 3 months at most
+# ODOO_DATABASE only if several databases share the host
 
 # Google Sheets
 GOOGLE_SHEETS_ID=1abc...xyz
@@ -566,13 +734,13 @@ const PICKING_ID = 1341658; // replace with target ID
 
   const picking = await odoo.read(
     'stock.picking', PICKING_ID,
-    ['id', 'name', 'move_lines', 'origin']
+    ['id', 'name', 'origin']
   );
   console.log('Picking:', picking.name);
 
   const lines = await odoo.searchRead(
     'stock.move',
-    [['id', 'in', picking.move_lines]],
+    [['picking_id', '=', PICKING_ID]], // same in every version
     ['id', 'product_id', 'state', 'product_uom_qty', 'name']
   );
 
@@ -599,34 +767,92 @@ const name = line.product_id;    // ❌ returns array, not string
 
 ### Version compatibility — field name differences
 
-The XML-RPC protocol is identical across all Odoo versions (v8–v17). Only a handful of field names changed:
+The XML-RPC protocol is the same from Odoo 8 to 19. What changes is field names, states and models
+(checked against the Odoo source of each branch):
 
-| Field | v8–v12 | v13+ | Safe fallback |
-|-------|--------|-------|---------------|
-| Transfer lines | `move_lines` | `move_ids` | `picking.move_ids \|\| picking.move_lines \|\| []` |
-| Scheduled date | `min_date` | `scheduled_date` | `picking.scheduled_date \|\| picking.min_date` |
-| Detailed ops | _(not used)_ | `move_line_ids` (v14+) | check before using |
-| Invoice model | `account.invoice` | `account.move` (v13+) | ask user which version |
+| What | Before | After | Since |
+|------|--------|-------|-------|
+| Picking lines | `stock.picking.move_lines` | `move_ids` | **16** |
+| Picking scheduled date | `min_date` | `scheduled_date` | **11** |
+| Detailed operations | `pack_operation_ids` (`stock.pack.operation`) | `move_line_ids` (`stock.move.line`) | **11** |
+| Done quantity on a move | `stock.move.quantity_done` | `quantity` | **17** |
+| Stockable product | `type = 'product'` | `type = 'consu'` + `is_storable = true` | **18** |
+| Invoices | `account.invoice` | `account.move` | **13** |
+| Customer / supplier flag | booleans `customer`, `supplier` | `customer_rank`, `supplier_rank` | **13** |
+| Locked sale order | state `done` | state `sale` + `locked = true` | **17** |
+| Locked purchase order | state `done` | state `purchase` + `locked = true` | **19** |
+| `stock.picking.move_ids_without_package` | exists (12–18) | removed | **19** |
+| `res.partner.mobile` | exists | removed | **19** |
 
-Always use safe fallbacks when writing code that should work across versions:
+**Don't "fall back" by asking for both names.** Requesting a field that doesn't exist in that version
+makes the whole call fail. Ask the server which fields it has, once, and build the field list from that:
 
 ```javascript
-// v8–v17 safe patterns
-const lines    = picking.move_ids      || picking.move_lines || [];
-const date     = picking.scheduled_date || picking.min_date;
-const invoice  = 'account.move'; // v13+, or 'account.invoice' for v8–v12
+const pickingFields = await odoo.fieldsGet('stock.picking');
+const LINES = 'move_ids' in pickingFields ? 'move_ids' : 'move_lines';
+const DATE  = 'scheduled_date' in pickingFields ? 'scheduled_date' : 'min_date';
+
+const pickings = await odoo.searchRead('stock.picking', domain, ['id', 'name', 'state', LINES, DATE]);
 ```
 
-When the user mentions their Odoo version, use the exact field name. When unknown, use the safe fallback and add a comment.
+When the user tells you their version, use the exact names from the table and skip the detection.
 
-### `date` field format
-Odoo returns dates as `"2026-03-25 14:30:00"`. To get only the date part:
+### Dates and datetimes are UTC strings
+Odoo returns datetimes as naive **UTC** strings (`"2026-03-25 14:30:00"`), never in the user's timezone.
+Compare `write_date` in UTC, and convert external timestamps to UTC before writing them.
 ```javascript
-const dateOnly = picking.date.split(' ')[0]; // "2026-03-25"
+const dateOnly = picking.date.split(' ')[0];                    // "2026-03-25" (UTC date)
+const asDate   = new Date(picking.date.replace(' ', 'T') + 'Z'); // real Date object
 ```
 
-### searchRead limit
-Default limit in OdooClient is 100. For production syncs always set `limit: 1000` (or use pagination with `offset`).
+### Empty values are `false`, not `null`
+An empty many2one, char or date comes back as `false`. Coerce explicitly (`line.product_id ? line.product_id[0] : null`,
+`partner.email || ''`) and drop non-integer values from id lists before using them in an `in` domain.
+
+### searchRead limit can silently cut the newest records
+Default limit in OdooClient is 100. With `order: 'date asc'` and more matching records than the limit, the ones
+you lose are the newest, and nothing warns you. For production syncs either page through everything
+(`order: 'id'`, `offset` += `limit`, until a page comes back shorter than `limit`) or log a warning when
+`result.length === limit`. Pages of 1,000–2,000 records per call work well.
+
+### `read` fails where `search_read` stays silent
+If a record rule hides one of the ids, `read(ids)` raises an AccessError for the whole batch, while
+`search_read([['id', 'in', ids]])` just leaves that record out. Pick one on purpose, and log when fewer records
+come back than you asked for.
+
+### A domain on a non-stored computed field can be ignored
+In older versions (seen on Odoo 8 with `stock.picking.sale_id`), filtering on a computed field that isn't stored
+and has no search method returns unfiltered results instead of an error. Check `fieldsGet(model)[field].store`
+before filtering on it, and filter on a stored field instead (for pickings of a sale order: `group_id`).
+
+### Creating records over the API skips the UI
+- **Onchanges don't run.** Whatever the form fills in when you pick a customer or a product (payment terms,
+  fiscal position, taxes, UoM…) must be sent explicitly. Read the record back after `create` and compare.
+- **Defaults are not what users expect.** Send every field you care about; don't rely on defaults.
+- **Automated actions and crons still fire** on records created over the API (emails, workflows, auto-confirm).
+  List `ir.cron` and the automated actions before the first write.
+- **Totals may differ by a cent.** Check whether taxes are included in prices (`account.tax.price_include`) and the
+  company's `tax_calculation_rounding_method` before comparing totals with the source system.
+
+### Idempotent creates
+Before creating, search for the record by an external reference you control (`origin`, `ref` or a deterministic
+`name`) in **any** state, with context `{ active_test: false }` so archived records are found too. Never run two
+writers on the same model at the same time.
+
+### Incremental sync by `write_date`
+Save the last run time, subtract a safety overlap (e.g. 15 minutes) and query `write_date >= since`. Stock moves
+update `stock.quant`, not the product: to catch stock changes, query both. Keep a list of failed pushes to retry,
+because a failure on the other system doesn't change anything in Odoo and the next run won't see it.
+
+### Check permissions before the first run
+On Odoo 8–19, `check_access_rights(operation, raise_exception=False)` on each model tells you whether the
+integration user can `read`/`create`/`write` before anything breaks halfway (Odoo 18+ also has `has_access`).
+
+### Retries and proxies
+- Retry **reads** on network errors with backoff. Never retry **writes** automatically: you may create duplicates.
+- Some reverse proxies drop requests with non-browser or empty User-Agents. If calls hang or close without a
+  response, set an explicit User-Agent.
+- Put every write behind one switch in the client so a dry run is the default.
 
 ### Authentication returns `false` (not an error)
 When `uid === false`, credentials are wrong or the database name is incorrect. The `xmlrpc` library will NOT throw — it returns `false`. Always check `if (!uid)`.
@@ -641,10 +867,11 @@ xmlrpc.createSecureClient({ host, port: 443, path })
 xmlrpc.createClient({ host, port: 8069, path })
 ```
 
-### Fields not returned unless explicitly requested
-Odoo XML-RPC never returns all fields by default. Always specify fields:
+### Always pass the field list
+Called with an empty field list, Odoo returns **every** field of the model (slow and heavy). These clients
+default to `['id', 'name']` instead, so always pass the fields you need:
 ```javascript
-// Wrong — returns only id and name:
+// Wrong — the client only returns id and name:
 await odoo.searchRead('stock.picking', [], []);
 
 // Correct:
@@ -696,6 +923,9 @@ Settings → Users → New User
 
 If the credentials are ever compromised, a read-only restricted user limits the blast radius to data exposure — not data modification or deletion.
 
+Prefer an **API key** over the user's password, on XML-RPC too (it goes in the password parameter). A key can be
+revoked without touching the user's login, and on JSON-2 it is the only option.
+
 ### Google Service Account — restrict scope
 The service account should only have `Editor` access to the specific spreadsheet, not to the entire Google Drive. Share the sheet with the service account email directly, not at folder/Drive level.
 
@@ -713,6 +943,11 @@ The service account should only have `Editor` access to the specific spreadsheet
 
 ## Checklist for every new Odoo integration
 
+- [ ] Odoo version known (`/web/version`), and field names checked against the version table or `fieldsGet`
+- [ ] Odoo 19+: new integrations use JSON-2; existing XML-RPC ones have a migration date before Odoo 22 / Online 21.1
+- [ ] API key expiry date written down (3 months max)
+- [ ] Odoo Online: the customer is on the Custom plan (no external API otherwise)
+- [ ] Crons and automated actions that fire on create/write reviewed before the first write
 - [ ] `.gitignore` exists and covers `.env`, `credentials.json`, `*.env*`
 - [ ] No real credentials or secrets in any `.md` or documentation file
 - [ ] Odoo sync user is read-only and restricted to needed models only
