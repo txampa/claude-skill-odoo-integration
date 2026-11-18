@@ -58,7 +58,7 @@ Just describe what you need.
 ## Version compatibility
 
 The XML-RPC protocol is the same from Odoo 8 to 19. What changes is field names, states and models. Checked against
-the Odoo source of each branch:
+the Odoo source of each branch, and the Odoo 19 rows against a running Odoo 19:
 
 | What | Before | After | Since |
 |------|--------|-------|-------|
@@ -71,6 +71,8 @@ the Odoo source of each branch:
 | Customer / supplier | booleans `customer`, `supplier` | `customer_rank`, `supplier_rank` | 13 |
 | Locked sale order | state `done` | `sale` + `locked` | 17 |
 | Locked purchase order | state `done` | `purchase` + `locked` | 19 |
+| `stock.picking.date` | exists | removed (use `create_date`) | 19 |
+| `stock.move.name` | exists | removed | 19 |
 | `res.partner.mobile` | exists | removed | 19 |
 
 Asking for a field that doesn't exist in that version makes the whole call fail, so the skill doesn't "fall back" by
@@ -87,6 +89,8 @@ const DATE  = 'scheduled_date' in fields ? 'scheduled_date' : 'min_date';
 ## What's new in v2
 
 - **JSON-2 client** for Odoo 19+, with the same interface as the XML-RPC one, and a migration path.
+- **Tested against a running Odoo 19.0**: both clients, every field list in the skill, errors and API keys.
+  That test caught two more fields removed in 19 (`stock.picking.date`, `stock.move.name`).
 - **Version table corrected.** v1 said `move_ids` and `scheduled_date` arrived in Odoo 13: they arrived in 16 and 11.
   Added the changes in 17, 18 and 19.
 - **`fieldsGet`** on both clients, to pick field names from the server instead of guessing.

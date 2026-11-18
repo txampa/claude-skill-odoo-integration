@@ -310,10 +310,11 @@ module.exports = OdooJson2Client;
 **Key fields** (asking for a field that doesn't exist in that version makes the whole call fail):
 ```javascript
 // Odoo 16+
-['id', 'name', 'state', 'date', 'move_ids', 'origin',
+['id', 'name', 'state', 'create_date', 'move_ids', 'origin',
  'partner_id', 'picking_type_id', 'scheduled_date']
 // Odoo 11–15: 'move_lines' instead of 'move_ids'
 // Odoo 8–10:  'move_lines' and 'min_date' instead of 'scheduled_date'
+// 'date' (creation date) exists up to 18 only: 'create_date' works in every version
 ```
 
 **Typical domain — "Esperando Disponibilidad":**
@@ -341,8 +342,9 @@ module.exports = OdooJson2Client;
 ```javascript
 // Odoo 17+
 ['id', 'product_id', 'state', 'product_uom_qty',
- 'quantity', 'name', 'picking_id']
+ 'quantity', 'picking_id', 'reference']
 // Odoo 8–16: 'quantity_done' instead of 'quantity'
+// 'reference' exists since 11 · 'name' (line description) exists up to 18 only
 ```
 
 **To get lines for a picking:**
@@ -350,7 +352,7 @@ module.exports = OdooJson2Client;
 const moveLines = await odoo.searchRead(
   'stock.move',
   [['picking_id', '=', picking.id]], // works in every version, no need to know move_ids vs move_lines
-  ['id', 'product_id', 'state', 'product_uom_qty', 'name']
+  ['id', 'product_id', 'state', 'product_uom_qty'] // fields that exist in every version
 );
 // Filter by state:
 const waitingLines = moveLines.filter(l => l.state === 'confirmed');
@@ -458,7 +460,7 @@ class SyncManager {
     // 3. Build domain dynamically
     const domain = [['state', 'in', ['waiting', 'confirmed']]];
     if (lastDate) {
-      domain.push(['date', '>=', lastDate]);
+      domain.push(['create_date', '>=', lastDate]);
     }
 
     // 4. Fetch from Odoo — field name depends on the version (move_ids since 16)
@@ -467,11 +469,11 @@ class SyncManager {
     const LIMIT = 1000;
     const records = await this.odoo.searchRead(
       'stock.picking', domain,
-      ['id', 'name', 'state', 'date', LINES, 'origin'],
-      { limit: LIMIT, order: 'date asc' }
+      ['id', 'name', 'state', 'create_date', LINES, 'origin'],
+      { limit: LIMIT, order: 'create_date asc' }
     );
     if (records.length === LIMIT) {
-      // More records than the limit: with 'date asc' the newest ones were left out. Page with offset or narrow the domain.
+      // More records than the limit: with 'create_date asc' the newest ones were left out. Page with offset or narrow the domain.
       console.warn(`stock.picking: got exactly ${LIMIT} records, some were not read`);
     }
 
@@ -483,7 +485,7 @@ class SyncManager {
 
       const detail = await this.odoo.read(
         'stock.picking', record.id,
-        ['id', 'name', 'date', LINES, 'origin']
+        ['id', 'name', 'create_date', LINES, 'origin']
       );
       if (!detail) continue;
 
@@ -690,7 +692,7 @@ const OdooClient = require('./config/odoo');
 
   const pickings = await odoo.searchRead(
     'stock.picking', [],
-    ['id', 'name', 'state', 'date'],
+    ['id', 'name', 'state', 'create_date'],
     { limit: 5 }
   );
   console.log('Sample pickings:', JSON.stringify(pickings, null, 2));
@@ -708,7 +710,7 @@ const OdooClient = require('./config/odoo');
 
   const records = await odoo.searchRead(
     'stock.picking', [],
-    ['id', 'name', 'state', 'date'],
+    ['id', 'name', 'state', 'create_date'],
     { limit: 100 }
   );
 
@@ -741,13 +743,13 @@ const PICKING_ID = 1341658; // replace with target ID
   const lines = await odoo.searchRead(
     'stock.move',
     [['picking_id', '=', PICKING_ID]], // same in every version
-    ['id', 'product_id', 'state', 'product_uom_qty', 'name']
+    ['id', 'product_id', 'state', 'product_uom_qty']
   );
 
   const byState = {};
   lines.forEach(l => {
     if (!byState[l.state]) byState[l.state] = [];
-    byState[l.state].push(l.product_id[1] || l.name);
+    byState[l.state].push(l.product_id ? l.product_id[1] : `move ${l.id}`);
   });
   console.log('Lines by state:', JSON.stringify(byState, null, 2));
 })();
@@ -768,7 +770,7 @@ const name = line.product_id;    // ❌ returns array, not string
 ### Version compatibility — field name differences
 
 The XML-RPC protocol is the same from Odoo 8 to 19. What changes is field names, states and models
-(checked against the Odoo source of each branch):
+(checked against the Odoo source of each branch, and the Odoo 19 rows against a running Odoo 19):
 
 | What | Before | After | Since |
 |------|--------|-------|-------|
@@ -782,6 +784,8 @@ The XML-RPC protocol is the same from Odoo 8 to 19. What changes is field names,
 | Locked sale order | state `done` | state `sale` + `locked = true` | **17** |
 | Locked purchase order | state `done` | state `purchase` + `locked = true` | **19** |
 | `stock.picking.move_ids_without_package` | exists (12–18) | removed | **19** |
+| `stock.picking.date` (creation date) | exists | removed: use `create_date` (every version) | **19** |
+| `stock.move.name` (line description) | exists | removed: use `product_id[1]`, or `reference` (11+) | **19** |
 | `res.partner.mobile` | exists | removed | **19** |
 
 **Don't "fall back" by asking for both names.** Requesting a field that doesn't exist in that version
@@ -801,8 +805,8 @@ When the user tells you their version, use the exact names from the table and sk
 Odoo returns datetimes as naive **UTC** strings (`"2026-03-25 14:30:00"`), never in the user's timezone.
 Compare `write_date` in UTC, and convert external timestamps to UTC before writing them.
 ```javascript
-const dateOnly = picking.date.split(' ')[0];                    // "2026-03-25" (UTC date)
-const asDate   = new Date(picking.date.replace(' ', 'T') + 'Z'); // real Date object
+const dateOnly = picking.create_date.split(' ')[0];                    // "2026-03-25" (UTC date)
+const asDate   = new Date(picking.create_date.replace(' ', 'T') + 'Z'); // real Date object
 ```
 
 ### Empty values are `false`, not `null`
@@ -810,7 +814,7 @@ An empty many2one, char or date comes back as `false`. Coerce explicitly (`line.
 `partner.email || ''`) and drop non-integer values from id lists before using them in an `in` domain.
 
 ### searchRead limit can silently cut the newest records
-Default limit in OdooClient is 100. With `order: 'date asc'` and more matching records than the limit, the ones
+Default limit in OdooClient is 100. With `order: 'create_date asc'` and more matching records than the limit, the ones
 you lose are the newest, and nothing warns you. For production syncs either page through everything
 (`order: 'id'`, `offset` += `limit`, until a page comes back shorter than `limit`) or log a warning when
 `result.length === limit`. Pages of 1,000–2,000 records per call work well.
@@ -875,7 +879,7 @@ default to `['id', 'name']` instead, so always pass the fields you need:
 await odoo.searchRead('stock.picking', [], []);
 
 // Correct:
-await odoo.searchRead('stock.picking', [], ['id', 'name', 'state', 'date', 'origin']);
+await odoo.searchRead('stock.picking', [], ['id', 'name', 'state', 'create_date', 'origin']);
 ```
 
 ---
